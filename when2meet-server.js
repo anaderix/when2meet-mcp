@@ -411,9 +411,117 @@ server.tool(
 );
 
 /**
+ * Tool: create-event
+ * Creates a new When2Meet event and returns its URL.
+ *
+ * @param {string} eventName - Name for the new event
+ * @param {string} startDate - Start date in YYYY-MM-DD format
+ * @param {string} endDate - End date in YYYY-MM-DD format
+ * @param {number} noEarlierThan - Earliest hour (0-23)
+ * @param {number} noLaterThan - Latest hour (0-23)
+ * @param {string} timeZone - Optional IANA timezone (e.g. "America/New_York")
+ * @returns The URL of the newly created When2Meet event
+ */
+server.tool(
+  "create-event",
+  {
+    eventName: z.string().min(1, "Event name is required"),
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format"),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format"),
+    noEarlierThan: z.number().int().min(0).max(23).describe("Earliest hour (0-23)"),
+    noLaterThan: z.number().int().min(0).max(23).describe("Latest hour (0-23)"),
+    timeZone: z.string().optional().describe("IANA timezone, e.g. America/New_York")
+  },
+  async ({ eventName, startDate, endDate, noEarlierThan, noLaterThan, timeZone }) => {
+    try {
+      // Validate dates
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        throw new Error("Invalid date format. Use YYYY-MM-DD.");
+      }
+      if (end < start) {
+        throw new Error("End date cannot be before start date.");
+      }
+
+      // Build pipe-separated date range (same format as the Rust CLI)
+      const dates = [];
+      const current = new Date(startDate);
+      const endD = new Date(endDate);
+      while (current <= endD) {
+        dates.push(current.toISOString().slice(0, 10));
+        current.setDate(current.getDate() + 1);
+      }
+      const possibleDates = dates.join("|");
+
+      // Build multipart form body
+      const boundary = "----When2MeetBoundary" + Date.now();
+      const parts = [
+        ["NewEventName", eventName],
+        ["DateTypes", "SpecificDates"],
+        ["PossibleDates", possibleDates],
+        ["NoEarlierThan", String(noEarlierThan)],
+        ["NoLaterThan", String(noLaterThan)],
+      ];
+      if (timeZone) {
+        parts.push(["TimeZone", timeZone]);
+      }
+
+      let body = "";
+      for (const [name, value] of parts) {
+        body += `--${boundary}\r\n`;
+        body += `Content-Disposition: form-data; name="${name}"\r\n\r\n`;
+        body += `${value}\r\n`;
+      }
+      body += `--${boundary}--\r\n`;
+
+      // POST to When2Meet
+      const response = await fetch("https://www.when2meet.com/SaveNewEvent.php", {
+        method: "POST",
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body,
+      });
+
+      if (!response.ok) {
+        throw new Error(`When2Meet returned HTTP ${response.status}`);
+      }
+
+      const html = await response.text();
+
+      // Parse the redirect URL from <body onload="window.location='/EVENT_ID'">
+      const match = html.match(/onload\s*=\s*["']window\.location\s*=\s*'([^']+)'/);
+      if (!match) {
+        throw new Error("Could not parse event URL from When2Meet response.");
+      }
+
+      const eventUrl = "https://www.when2meet.com" + match[1];
+
+      return {
+        content: [{
+          type: "text",
+          text: `Event created successfully!\nName: ${eventName}\nDates: ${startDate} to ${endDate}\nHours: ${noEarlierThan}:00 - ${noLaterThan}:00${timeZone ? `\nTimezone: ${timeZone}` : ""}\nURL: ${eventUrl}`
+        }],
+        eventUrl
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error creating event: ${error.message || "Unknown error"}`
+        }],
+        error: true,
+        errorMessage: error.message || "Unknown error"
+      };
+    }
+  }
+);
+
+/**
  * Tool: help
  * Provides information about the available tools and how to use them.
- * 
+ *
  * @returns Description of all available tools
  */
 server.tool(
@@ -425,31 +533,40 @@ server.tool(
         type: "text",
         text: `When2Meet MCP Server - Available Tools:
 
-1. get-event-details
+1. create-event
+   - Creates a new When2Meet event
+   - Input: eventName, startDate, endDate, noEarlierThan, noLaterThan, timeZone (optional)
+   - Output: URL of the newly created event
+
+2. get-event-details
    - Extracts information from a When2Meet URL
    - Input: eventUrl (string)
    - Output: Event name, date range, available time slots
 
-2. generate-availability-prompt
+3. generate-availability-prompt
    - Creates a structured prompt for selecting time slots
    - Input: eventDetails (object from get-event-details)
    - Output: Selection prompt with time slot codes and timestamps
 
-3. parse-availability-selections
+4. parse-availability-selections
    - Converts selection codes to actual timestamps
    - Input: selections (string), promptData (object)
    - Output: Array of timestamps and human-readable times
 
-4. mark-when2meet-availability
+5. mark-when2meet-availability
    - Marks selected time slots as available on When2Meet
    - Input: eventUrl, userName, password (optional), timestamps
    - Output: Number of marked slots and result URL
 
-Example workflow:
-1. Get event details with get-event-details
-2. Generate selection prompt with generate-availability-prompt
-3. Convert selections to timestamps with parse-availability-selections
-4. Mark availability with mark-when2meet-availability`
+Example workflows:
+A) Create a new event:
+   1. Create event with create-event → get URL to share
+
+B) Fill in an existing event:
+   1. Get event details with get-event-details
+   2. Generate selection prompt with generate-availability-prompt
+   3. Convert selections to timestamps with parse-availability-selections
+   4. Mark availability with mark-when2meet-availability`
       }]
     };
   }
